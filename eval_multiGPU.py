@@ -1,4 +1,3 @@
-
 import os
 import glob
 import datetime
@@ -6,14 +5,18 @@ import torch
 import numpy as np
 from rdkit import Chem
 import torchdiffeq
-from utils.data_utils import ReactionDataset, BEmatrix_to_mol, ps
-from utils.rounding import saferound_tensor
+from utils.data_utils import ReactionDataset, BEmatrix_to_mol, ps, fullSanitize, standardize_smiles
+from utils.rounding import custom_round_optimized, saferound_tensor
 import torch.distributed as dist
 from train import init_model, init_loader
+from model.oxd_states import OxdStatesCalculator
 from utils.train_utils import log_rank_0, setup_logger, log_args
-from settings import Args
+from other.settings import Args
 from collections import defaultdict
+from multiprocessing import Pool
 import time
+import math
+from rdkit.Chem import AllChem, rdchem
 import iteround
 
 ps = Chem.SmilesParserParams()
@@ -41,13 +44,50 @@ def redist_fix(pred_matrix, reac_smi, reac_be_matrix):
 
     return pred_matrix
 
-# # old implementation uses CPU
-# def redistribute_round(x):
-#     rounded_diff = iteround.saferound(x.flatten().cpu().numpy().tolist(), 0)
-#     rounded_diff = torch.as_tensor(rounded_diff, dtype=torch.float).view(*x.shape)
-#     return rounded_diff.to(x)
+def steering_linear (t):
+    return (1 - t) * Args.diverse_lambda
 
-# new implementation uses GPU
+def steering_cosine (t):
+    return 0.5 * (1 + torch.cos(t * math.pi)) * Args.diverse_lambda 
+
+def estimate_final_one_step(x, t, v):
+    # x and v; (sample_size, n, n)
+    dt = (1 - t).view(1, 1, 1)
+    return x + dt * v
+
+def median_upper_triu(D2):
+    idx = torch.triu_indices(D2.size(0), D2.size(1), offset=1)
+    vals = D2[idx[0], idx[1]]
+    return torch.median(vals)
+
+def diverse_flow (x, t, v):
+    x_1 = estimate_final_one_step(x, t, v)
+    B = x_1.size(0)
+
+    # Efficient pairwise distances
+    x_flat = x_1.view(B, -1)
+    norms = (x_flat ** 2).sum(dim=1)
+    gram = x_flat @ x_flat.t()
+    D2 = norms[:, None] + norms[None, :] - 2 * gram
+    D2.clamp_min_(0.0)
+
+    sigma2 = median_upper_triu(D2).clamp_min(1e-12)
+    K = torch.exp(-D2 / (2 * sigma2))
+
+    # Stable inverse
+    K_stable = K + 1e-5 * torch.eye(B, device=x.device)
+    K_inv = torch.inverse(K_stable)
+
+    # Analytic gradient: sum_j K_inv[i,j] * K[i,j] * (X_j - X_i)
+    # (B, B, n*n)
+    diff =  x_flat[None, :, :] - x_flat[:, None, :] # (B,B,n*n)
+    grad_flat = 2 / sigma2 * (K_inv * K)[:, :, None] * diff  # broadcast
+    grad_flat = grad_flat.sum(dim=1)  # sum over j -> (B, n*n)
+    grad = grad_flat.view_as(x_1)
+
+    g_norm = grad.view(B, -1).norm(dim=1).mean().clamp_min(1e-6)
+    return grad / g_norm
+
 def redistribute_round(x):
     rounded = saferound_tensor(x, places=0, strategy="difference")
     return rounded
@@ -59,21 +99,21 @@ def custom_round(x):
         except: output.append(torch.round(x[i]))
     return torch.stack(output)
 
-def standardize_smiles(mol):
-    [a.SetAtomMapNum(0) for a in mol.GetAtoms()]
-    return Chem.MolToSmiles(mol, isomericSmiles=False, allHsExplicit=True)
-
 def split_number(number, num_parts):
     if number % num_parts != 0:
         raise ValueError("The number cannot be evenly divided into the specified number of parts.")
     return [number // num_parts] * num_parts
 
-start = time.time()
 def predict_batch(args, batch_idx, data_batch, model, flow, split, rand_matrix=None):
     src_data_indices = data_batch.src_data_indices
     y = data_batch.src_token_ids
     y_len = data_batch.src_lens
     x0 = data_batch.src_matrices
+    calc = _get_oxd_calc(args)
+    if args.oxd_states:
+        a_nums = data_batch.src_a_nums
+        a_masks = data_batch.src_a_masks
+
     # x1 = data_batch.tgt_matrices
     matrix_masks = data_batch.matrix_masks
 
@@ -90,27 +130,108 @@ def predict_batch(args, batch_idx, data_batch, model, flow, split, rand_matrix=N
     for sample_size in split_sample_batches:
         src_data_indices = src_data_indices.repeat_interleave(sample_size, dim=0)
         x0_repeated = x0.repeat_interleave(sample_size, dim=0)
-        x0_sample_repeated = flow.sample_be_matrix(x0_repeated)
 
-        matrix_masks_repeated = matrix_masks.repeat_interleave(sample_size, dim=0)
-        x0_sample_repeated = x0_sample_repeated.masked_fill(~(matrix_masks_repeated.bool()), 0) # ode initial step has RMS norm thus padding nan has to be swap to 0
-        
-        del matrix_masks_repeated
-        torch.cuda.empty_cache()
+        if args.pred_del_BE:
+            x0_sample_repeated = flow.sample_noised_zero_like(x0_repeated)
+            matrix_masks_repeated = matrix_masks.repeat_interleave(sample_size, dim=0)
+            x0_sample_repeated = x0_sample_repeated.masked_fill(~(matrix_masks_repeated.bool()), 0) # ode initial step has RMS norm thus padding nan has to be swap to 0
+            x0_repeated = x0_repeated.masked_fill(~(matrix_masks_repeated.bool()), 0)
 
-        y_repeated = y.repeat_interleave(sample_size, dim=0)
-        y_len_batch_repeated = y_len.repeat_interleave(sample_size, dim=0)
+            if args.oxd_states:
+                a_nums_repeated = a_nums.repeat_interleave(sample_size, dim=0)
+                a_masks_repeated = a_masks.repeat_interleave(sample_size, dim=0)
+                a_nums_repeated = a_nums_repeated.masked_fill(~(a_masks_repeated.bool()), 0)
 
-        traj_list = torchdiffeq.odeint_adjoint(
-            lambda t, x: model(y_repeated, y_len_batch_repeated, x, t),
-            x0_sample_repeated,
-            torch.linspace(0, 1, 2).to(args.device),
-            atol=1e-4,
-            rtol=1e-4,
-            method="dopri5",
-            adjoint_params=()
-        )
-        big_traj_list.append((traj_list.transpose(0, 1).detach().cpu(), sample_size))
+            del matrix_masks_repeated
+
+            y_repeated = y.repeat_interleave(sample_size, dim=0)
+            y_len_batch_repeated = y_len.repeat_interleave(sample_size, dim=0)
+
+            if args.oxd_states:
+                def del_BE_ode_oxd(t, x):
+                    oxd_states = calc.forward(x + x0_repeated, a_nums_repeated)
+                    return model.forward(y_repeated, y_len_batch_repeated, x0_repeated, t, oxd_states=oxd_states, del_BE=x)
+
+                traj_list = torchdiffeq.odeint(
+                    del_BE_ode_oxd,
+                    x0_sample_repeated,
+                    torch.linspace(0, 1, 2).to(args.device),
+                    atol=args.inf_tol,
+                    rtol=args.inf_tol,
+                    method="dopri5",
+                )
+
+            else:
+                def del_BE_ode(t, x):
+                    v = model.forward(y_repeated, y_len_batch_repeated, x0_repeated, t, del_BE=x)
+                    if args.diverse_flow:
+                        return v + steering_cosine(t) * diverse_flow(x, t, v)
+
+                    return v
+                
+                traj_list = torchdiffeq.odeint(
+                    del_BE_ode,
+                    x0_sample_repeated,
+                    torch.linspace(0, 1, 2).to(args.device),
+                    atol=args.inf_tol,
+                    rtol=args.inf_tol,
+                    method="dopri5",
+                )
+
+            x0_expanded = x0_repeated.unsqueeze(0)
+            traj_list = traj_list + x0_expanded
+
+            big_traj_list.append((traj_list.transpose(0, 1).detach().cpu(), sample_size))
+
+        else:
+            x0_sample_repeated = flow.sample_be_matrix(x0_repeated)
+
+            matrix_masks_repeated = matrix_masks.repeat_interleave(sample_size, dim=0)
+            x0_sample_repeated = x0_sample_repeated.masked_fill(~(matrix_masks_repeated.bool()), 0) # ode initial step has RMS norm thus padding nan has to be swap to 0
+            
+            if args.oxd_states:
+                a_nums_repeated = a_nums.repeat_interleave(sample_size, dim=0)
+                a_masks_repeated = a_masks.repeat_interleave(sample_size, dim=0)
+                a_nums_repeated = a_nums_repeated.masked_fill(~(a_masks_repeated.bool()), 0)
+
+            del matrix_masks_repeated
+
+            y_repeated = y.repeat_interleave(sample_size, dim=0)
+            y_len_batch_repeated = y_len.repeat_interleave(sample_size, dim=0)
+            
+            if args.oxd_states:
+
+                def oxd_ode (t, x):
+                    oxd_states = calc.forward(x, a_nums_repeated)
+                    #print(oxd_states)
+                    
+                    v = model.forward(y_repeated, y_len_batch_repeated, x, t, oxd_states=oxd_states)
+                    if args.diverse_flow:
+                        return v + steering_cosine(t) * diverse_flow(x, t, v)
+                    
+                    return v
+                
+                traj_list = torchdiffeq.odeint(
+                    oxd_ode,
+                    x0_sample_repeated,
+                    torch.linspace(1, 0, 2).to(args.device) if args.reverse_flow else torch.linspace(0, 1, 2).to(args.device),
+                    atol=args.inf_tol,
+                    rtol=args.inf_tol,
+                    method="dopri5",
+                )
+
+                big_traj_list.append((traj_list.transpose(0, 1).detach().cpu(), sample_size))
+
+            else: 
+                traj_list = torchdiffeq.odeint(
+                    lambda t, x: model.forward(y_repeated, y_len_batch_repeated, x, t),
+                    x0_sample_repeated,
+                    torch.linspace(0, 1, 2).to(args.device),
+                    atol=args.inf_tol,
+                    rtol=args.inf_tol,
+                    method="dopri5",
+                )
+                big_traj_list.append((traj_list.transpose(0, 1).detach().cpu(), sample_size))
 
     # merging
     all_traj_list = []
@@ -121,7 +242,166 @@ def predict_batch(args, batch_idx, data_batch, model, flow, split, rand_matrix=N
     # ------------------------------------#
     return traj_list
 
-def get_predictions(args, model, flow, data_loader, iter_count=np.inf, write_o=None):
+start = time.time()
+
+_OXD_CALC_CACHE = {}
+
+def _get_oxd_calc(args):
+    device_key = str(args.device)
+    calc = _OXD_CALC_CACHE.get(device_key)
+    if calc is None:
+        calc = OxdStatesCalculator(args)
+        _OXD_CALC_CACHE[device_key] = calc
+    return calc
+
+def predict_batch_new(args, batch_idx, data_batch, model, flow, split, rand_matrix=None, reverse=False):
+    """
+    New predict_batch that does custom_round on GPU and returns rounded matrices directly.
+    Returns shape: (batch_size*sample_size, n, n), or
+    (batch_size*(sample_size//2), n, n) for each reverse_aug direction.
+    """
+    y = data_batch.src_token_ids
+    y_len = data_batch.src_lens
+    x0 = data_batch.src_matrices
+    calc = _get_oxd_calc(args)
+    if args.oxd_states:
+        a_nums = data_batch.src_a_nums
+        a_masks = data_batch.src_a_masks
+
+    matrix_masks = data_batch.matrix_masks
+    batch_size, n, n = x0.shape
+    
+    log_rank_0(f"Batch idx: {batch_idx}, batch_shape {batch_size, n, n} {(time.time() - start): .2f}s")
+    
+    if args.reverse_aug and args.sample_size % 2 != 0:
+        raise ValueError("reverse_aug requires an even sample_size")
+    if args.reverse_aug and args.reverse_flow:
+        raise ValueError("reverse_aug and reverse_flow cannot be enabled together")
+
+    reverse_direction = args.reverse_flow or reverse
+    noise_sigma = getattr(args, "reverse_sigma", args.sigma) if reverse_direction else None
+    SAMPLE_BATCH = args.sample_size // 2 if args.reverse_aug else args.sample_size
+    split_sample_batches = split_number(SAMPLE_BATCH, split)
+    
+    all_rounded_matrices = []
+    
+    for sample_size in split_sample_batches:
+        x0_repeated = x0.repeat_interleave(sample_size, dim=0)
+
+        if args.pred_del_BE:
+            x0_sample_repeated = flow.sample_noised_zero_like(x0_repeated, sigma=noise_sigma)
+            matrix_masks_repeated = matrix_masks.repeat_interleave(sample_size, dim=0)
+            x0_sample_repeated = x0_sample_repeated.masked_fill(~(matrix_masks_repeated.bool()), 0)
+            x0_repeated = x0_repeated.masked_fill(~(matrix_masks_repeated.bool()), 0)
+
+            if args.oxd_states:
+                a_nums_repeated = a_nums.repeat_interleave(sample_size, dim=0)
+                a_masks_repeated = a_masks.repeat_interleave(sample_size, dim=0)
+                a_nums_repeated = a_nums_repeated.masked_fill(~(a_masks_repeated.bool()), 0)
+
+            del matrix_masks_repeated
+
+            y_repeated = y.repeat_interleave(sample_size, dim=0)
+            y_len_batch_repeated = y_len.repeat_interleave(sample_size, dim=0)
+
+            if args.oxd_states:
+                def del_BE_ode_oxd(t, x):
+                    oxd_states = calc.forward(x + x0_repeated, a_nums_repeated)
+                    return model.forward(y_repeated, y_len_batch_repeated, x0_repeated, t, oxd_states=oxd_states, del_BE=x)
+
+                traj_list = torchdiffeq.odeint(
+                    del_BE_ode_oxd,
+                    x0_sample_repeated,
+                    torch.linspace(1, 0, 2).to(args.device) if reverse_direction else torch.linspace(0, 1, 2).to(args.device),
+                    atol=args.inf_tol,
+                    rtol=args.inf_tol,
+                    method="dopri5",
+                )
+            else:
+                def del_BE_ode(t, x):
+                    v = model.forward(y_repeated, y_len_batch_repeated, x0_repeated, t, del_BE=x)
+                    if args.diverse_flow:
+                        return v + steering_cosine(t) * diverse_flow(x, t, v)
+                        
+                    return v
+                
+                traj_list = torchdiffeq.odeint(
+                    del_BE_ode,
+                    x0_sample_repeated,
+                    torch.linspace(1, 0, 2).to(args.device) if reverse_direction else torch.linspace(0, 1, 2).to(args.device),
+                    atol=args.inf_tol,
+                    rtol=args.inf_tol,
+                    method="dopri5",
+                )
+
+            x0_expanded = x0_repeated.unsqueeze(0)
+            traj_list = traj_list + x0_expanded
+            final_state = traj_list[-1]  # Keep on GPU
+            del traj_list
+
+        else:
+            x0_sample_repeated = flow.sample_be_matrix(x0_repeated, sigma=noise_sigma)
+            matrix_masks_repeated = matrix_masks.repeat_interleave(sample_size, dim=0)
+            x0_sample_repeated = x0_sample_repeated.masked_fill(~(matrix_masks_repeated.bool()), 0)
+            
+            if args.oxd_states:
+                a_nums_repeated = a_nums.repeat_interleave(sample_size, dim=0)
+                a_masks_repeated = a_masks.repeat_interleave(sample_size, dim=0)
+                a_nums_repeated = a_nums_repeated.masked_fill(~(a_masks_repeated.bool()), 0)
+
+            del matrix_masks_repeated
+
+            y_repeated = y.repeat_interleave(sample_size, dim=0)
+            y_len_batch_repeated = y_len.repeat_interleave(sample_size, dim=0)
+            
+            if args.oxd_states:
+                def oxd_ode(t, x):
+                    oxd_states = calc.forward(x, a_nums_repeated)
+                    v = model.forward(y_repeated, y_len_batch_repeated, x, t, oxd_states=oxd_states)
+                    if args.diverse_flow:
+                        return v + steering_cosine(t) * diverse_flow(x, t, v)
+                        
+                    return v
+                        
+                
+                traj_list = torchdiffeq.odeint(
+                    oxd_ode,
+                    x0_sample_repeated,
+                    torch.linspace(1, 0, 2).to(args.device) if reverse_direction else torch.linspace(0, 1, 2).to(args.device),
+                    atol=args.inf_tol,
+                    rtol=args.inf_tol,
+                    method="dopri5",
+                )
+            else: 
+                traj_list = torchdiffeq.odeint(
+                    lambda t, x: model.forward(y_repeated, y_len_batch_repeated, x, t),
+                    x0_sample_repeated,
+                    torch.linspace(1, 0, 2).to(args.device) if reverse_direction else torch.linspace(0, 1, 2).to(args.device),
+                    atol=args.inf_tol,
+                    rtol=args.inf_tol,
+                    method="dopri5",
+                )
+
+            final_state = traj_list[-1]  # Keep on GPU
+            del traj_list
+
+
+        final_matrices = custom_round_optimized(final_state)
+        all_rounded_matrices.append(final_matrices)
+        
+        del final_state
+
+    if not args.reverse_aug:
+        return torch.cat(all_rounded_matrices, dim=0)
+
+    # Reverse augmentation reshapes both direction outputs per reactant in
+    # _run_predict, so join sample splits along the per-reactant sample axis.
+    return torch.cat(
+        [matrices.reshape(batch_size, -1, n, n) for matrices in all_rounded_matrices],
+        dim=1,
+    ).reshape(-1, n, n)
+
+def get_predictions(args, model, flow, data_loader, iter_count=np.inf, write_o=None, top1_only=False):
     accuracy = []
     model.eval()
     with torch.no_grad():
@@ -130,15 +410,20 @@ def get_predictions(args, model, flow, data_loader, iter_count=np.inf, write_o=N
             inferenced_indexes = set()
 
         for batch_idx, data_batch in enumerate(data_loader):
+            #log_rank_0(f"Rank {dist.get_rank()}: Processing batch {batch_idx}")
             if batch_idx >= iter_count: break
             data_batch.to(args.device)
 
             src_data_indices = data_batch.src_data_indices
             x0 = data_batch.src_matrices
+            #x1 = data_batch.tgt_matrices
             y_len = data_batch.src_lens
             batch_size, n, n = x0.shape
             src_smiles_list = data_batch.src_smiles_list
             tgt_smiles_list = data_batch.tgt_smiles_list
+            src_dative_donors = data_batch.src_d_donors
+            src_not_donors = data_batch.src_not_donors
+            # src_line_nums = data_batch.src_line_nums
 
 
             # if (batch_size*n*n) <= 5*360*360:
@@ -147,21 +432,25 @@ def get_predictions(args, model, flow, data_loader, iter_count=np.inf, write_o=N
             else:
                 traj_list = predict_batch(args, batch_idx, data_batch, model, flow, 2)
 
+            #log_rank_0(f"Rank {dist.get_rank()}: Completed predict for batch {batch_idx}")
+            
             if torch.distributed.is_initialized() and dist.get_world_size() > 1:
                 gathered_results = [None for _ in range(dist.get_world_size())]
                 dist.gather_object(
-                    (src_data_indices, traj_list, x0, y_len, src_smiles_list, tgt_smiles_list),
+                    (src_data_indices, traj_list, x0, y_len, src_smiles_list, tgt_smiles_list, src_dative_donors, src_not_donors),
                     gathered_results if dist.get_rank() == 0 else None,
                     dst=0
                 )
             else:
-                gathered_results = [(src_data_indices, traj_list, x0, y_len, src_smiles_list, tgt_smiles_list)]
+                gathered_results = [(src_data_indices, traj_list, x0, y_len, src_smiles_list, tgt_smiles_list, src_dative_donors, src_not_donors)]
+
+            #log_rank_0(f"Rank {dist.get_rank()}: Completed gather for batch {batch_idx}")
 
             if dist.get_rank() > 0:
                 continue
 
             for result in gathered_results:
-                src_data_indices, traj_list, x0, y_len, src_smiles_list, tgt_smiles_list = result
+                src_data_indices, traj_list, x0, y_len, src_smiles_list, tgt_smiles_list, src_dative_donors, src_not_donors  = result
                 batch_size, n, n = x0.shape
 
                 last_step = traj_list[-1]
@@ -169,36 +458,38 @@ def get_predictions(args, model, flow, data_loader, iter_count=np.inf, write_o=N
                 product_BE_matrices_batch = torch.split(product_BE_matrices, args.sample_size)
 
                 for idx in range(batch_size):
-                    reac_smi, product_smi, product_BE_matrices = \
-                        src_smiles_list[idx], tgt_smiles_list[idx], product_BE_matrices_batch[idx]
+                    reac_smi, product_smi, product_BE_matrices, donors, not_donors = \
+                        src_smiles_list[idx], tgt_smiles_list[idx], product_BE_matrices_batch[idx], src_dative_donors[idx], src_not_donors[idx],
                     
                     data_idx = int(src_data_indices[idx].detach().cpu())
                     if data_idx in inferenced_indexes: continue
                     else: inferenced_indexes.add(data_idx)
 
                     reac_mol = Chem.MolFromSmiles(reac_smi, ps)
-                    prod_mol = Chem.MolFromSmiles(product_smi, ps)
-
-                    tgt_smiles = standardize_smiles(prod_mol)
 
                     matrices, counts = torch.unique(product_BE_matrices, dim=0, return_counts=True)
+                    # true_prod_BE_matrix = true_prod_BE_matrix.cpu().numpy()
                     matrices, counts = matrices.cpu().numpy(), counts.cpu().numpy()
 
                     not_sym = 0
 
                     correct = wrong_smi_conserved = wrong_smi_non_conserved = 0
+                    #correct_be = 0
                     no_smi_conserved = no_smi_non_conserved = 0
 
                     pred_smi_dict = defaultdict(int)
                     pred_conserved_dict = defaultdict(bool)
+
+                    num_nodes = y_len[idx]
+                    reac_be_matrix = x0[idx][:num_nodes, :num_nodes].detach().cpu().numpy()
+
                     # Evaluation on unique predicted BE matrices
                     for i in range(matrices.shape[0]):
+                        
                         pred_prod_be_matrix, count = matrices[i], counts[i] # predicted product matrix and it's count
-                        num_nodes = y_len[idx]
                         pred_prod_be_matrix = pred_prod_be_matrix[:num_nodes, :num_nodes]
-                        reac_be_matrix = x0[idx][:num_nodes, :num_nodes].detach().cpu().numpy()
 
-                        # print(f"Matrix{i} - {count}")
+                        #print(f"Matrix{i} - {count}")
                         pred_prod_be_matrix = redist_fix(pred_prod_be_matrix, reac_smi, reac_be_matrix)
 
                         assert pred_prod_be_matrix.shape == reac_be_matrix.shape, "pred and reac not the same shape"
@@ -207,13 +498,19 @@ def get_predictions(args, model, flow, data_loader, iter_count=np.inf, write_o=N
                             not_sym += 1
 
                         try:
-                            pred_mol = BEmatrix_to_mol(reac_mol, pred_prod_be_matrix)
+                            pred_mol = BEmatrix_to_mol(reac_mol, pred_prod_be_matrix, donors, not_donors=not_donors)
                             pred_smi = standardize_smiles(pred_mol)
+                            pred_smi = fullSanitize(pred_smi)
+                            pred_smi = Chem.MolToSmiles(Chem.MolFromSmiles(pred_smi, ps), isomericSmiles=False, canonical=True, allHsExplicit=True)
 
-                            pred_mol = Chem.MolFromSmiles(pred_smi, ps)
-                            pred_smi = standardize_smiles(pred_mol)
-                            tgt_mol = Chem.MolFromSmiles(tgt_smiles, ps)
+
+                            tgt_mol = Chem.MolFromSmiles(product_smi, ps)
                             tgt_smiles = standardize_smiles(tgt_mol)
+                            tgt_smiles = fullSanitize(tgt_smiles)
+                            tgt_smiles = Chem.MolToSmiles(Chem.MolFromSmiles(tgt_smiles, ps), isomericSmiles=False, canonical=True, allHsExplicit=True)
+
+                            #if np.array_equal(pred_prod_be_matrix, true_prod_BE_matrix):
+                            #    correct_be += count
 
 
                             if pred_smi == tgt_smiles and pred_prod_be_matrix.sum() == reac_be_matrix.sum():
@@ -231,10 +528,25 @@ def get_predictions(args, model, flow, data_loader, iter_count=np.inf, write_o=N
                                 no_smi_conserved += count
                             else:
                                 no_smi_non_conserved += count
-                    
-                    metric = [correct, wrong_smi_conserved, wrong_smi_non_conserved, no_smi_conserved, no_smi_non_conserved]
-                    predictions = [(smi, pred_smi_dict[smi], pred_conserved_dict[smi]) for smi in pred_smi_dict]
-                    if write_o is not None: 
+                                
+                    metric = [int(x) for x in [correct, wrong_smi_conserved, wrong_smi_non_conserved,
+                           no_smi_conserved, no_smi_non_conserved]]
+                    predictions = [(smi, int(pred_smi_dict[smi]), bool(pred_conserved_dict[smi])) for smi in pred_smi_dict]
+
+                    if top1_only:
+                        # Sampling frequency is the model's ranking signal. Aggregate
+                        # equivalent matrices by product SMILES before selecting top-1.
+                        top1_smi = max(
+                            pred_smi_dict,
+                            key=lambda smi: (pred_smi_dict[smi], smi),
+                            default=None,
+                        )
+                        top1_correct = int(top1_smi == tgt_smiles) if top1_smi is not None else 0
+                        metric.append(top1_correct)
+
+                    #metric = [correct, wrong_smi_conserved, wrong_smi_non_conserved, no_smi_conserved, no_smi_non_conserved]
+                    #predictions = [(smi, pred_smi_dict[smi], pred_conserved_dict[smi]) for smi in pred_smi_dict]
+                    if write_o is not None:
                         write_o.write(f"{metric}|{not_sym}|{predictions}\n")
                         write_o.flush()
                     accuracy.append(metric)
@@ -245,6 +557,13 @@ def get_predictions(args, model, flow, data_loader, iter_count=np.inf, write_o=N
 def main(args):
     args.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     device = args.device
+
+    print("Local rank:", args.local_rank)
+    print("Available devices:", torch.cuda.device_count())
+    print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
+    print(f"[rank{os.environ.get('LOCAL_RANK', '?')}] CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
+    print(f"[rank{os.environ.get('LOCAL_RANK', '?')}] torch sees {torch.cuda.device_count()} devices")
+
     if args.local_rank != -1:
         dist.init_process_group(backend=args.backend, init_method='env://', timeout=datetime.timedelta(0, 7200))
         torch.cuda.set_device(args.local_rank)
@@ -305,17 +624,31 @@ def main(args):
         
         assert len(test_smiles_list) > 0, "Nothing to do inference"
         
-        test_dataset = ReactionDataset(args, test_smiles_list)
+        test_dataset = ReactionDataset(args, test_smiles_list, line_offset=start)
         test_loader = init_loader(args, test_dataset,
                                 batch_size=args.test_batch_size,
-                                shuffle=False, epoch=None, use_sort=False)
+                                shuffle=False, epoch=None, use_sort=False,
+                                drop_last=False)
 
         with open(results_path, file_mod) as result_o:
-            metrics = get_predictions(args, attn_model, flow, test_loader, write_o=result_o)
+            # metrics = get_predictions(args, attn_model, flow, test_loader, write_o=result_o, write_line_nums=True)
+            validation_top1 = args.do_validate and getattr(args, "validation_top1", False)
+            metrics = get_predictions(
+                args,
+                attn_model,
+                flow,
+                test_loader,
+                write_o=result_o,
+                top1_only=validation_top1,
+            )
         if dist.get_rank() == 0:
             metrics = np.array(metrics)
             topk_accuracies = np.mean(metrics[:, 0].astype(bool)) # correct smiles
-            log_rank_0(f"Topk accuracies: {(topk_accuracies * 100): .2f}")
+            # topk_accuracies_be = np.mean(metrics[:, -1].astype(bool))
+            log_rank_0(f"Top-k accuracy: {(topk_accuracies * 100): .2f}")
+            if validation_top1:
+                top1_accuracy = np.mean(metrics[:, -1].astype(bool))
+                log_rank_0(f"Top-1 accuracy: {(top1_accuracy * 100): .2f}")
 
 
 if __name__ == "__main__":

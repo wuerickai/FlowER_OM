@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from utils.attn_utils import PositionwiseFeedForward
 from utils.attn_utils import sequence_mask
 from utils.data_utils import ELEM_LIST
@@ -29,11 +30,12 @@ def timestep_embedding(timesteps, dim, max_period=10000):
 def zero_center_output(x_batch, ori_node_mask_batch):
     x_batch = x_batch.masked_fill(ori_node_mask_batch, 1e-19)
     node_mask_batch = (~ori_node_mask_batch).long()
-    map_zero_center = torch.vmap(zero_center_func)
-    return map_zero_center(x_batch, node_mask_batch).masked_fill(~(node_mask_batch.bool()), 1e-19)
+    mean = x_batch.sum(dim=(-2, -1), keepdim=True) / node_mask_batch.sum(dim=(-2, -1), keepdim=True)
+    x_batch = x_batch - mean * node_mask_batch
+    return x_batch.masked_fill(~(node_mask_batch.bool()), 1e-19)
 
 class RBFExpansion(nn.Module):
-    def __init__(self, args):
+    def __init__(self, args, oxd=False, del_BE=False):
         """
         Adapted from Schnet.
         https://github.com/atomistic-machine-learning/SchNet/blob/master/src/schnet/nn/layers/rbf.py
@@ -41,9 +43,19 @@ class RBFExpansion(nn.Module):
         super().__init__()
         self.args = args
         self.device = args.device
-        self.low = args.rbf_low
-        self.high = args.rbf_high
-        self.gap = args.rbf_gap
+            
+        if oxd:
+            self.high = args.rbf_oxd_high
+            self.low = args.rbf_oxd_low
+            self.gap = args.rbf_oxd_gap
+        elif del_BE:
+            self.high = args.rbf_delBE_high
+            self.low = args.rbf_delBE_low
+            self.gap = args.rbf_delBE_gap
+        else:
+            self.high = args.rbf_high
+            self.low = args.rbf_low
+            self.gap = args.rbf_gap
 
         self.xrange = self.high - self.low
         
@@ -52,8 +64,7 @@ class RBFExpansion(nn.Module):
         self.dim = len(self.centers)
 
     def forward(self, matrix, matrix_mask):
-        #matrix = matrix.masked_fill(matrix_mask, 1e9)
-        matrix = matrix.masked_fill(matrix_mask, torch.inf)
+        matrix = matrix.masked_fill(matrix_mask, 1e9)
         matrix = matrix.unsqueeze(-1)  # Add a new dimension at the end
         # Compute the RBF
         matrix = matrix - self.centers
@@ -126,47 +137,43 @@ class MultiHeadedRelAttention(nn.Module):
 
         # 2) Calculate and scale scores.
         query = query / math.sqrt(dim_per_head)
+        mask = mask.unsqueeze(1)                            # (B, 1, 1, T_values)
 
         if rel_emb is None:
-            scores = torch.matmul(
-                query, key.transpose(2, 3))                 # (b, head, t_q, t_k)
-            # scores = scores + rel_emb.unsqueeze(1)
+            q_eff = query
+            attn_bias = torch.zeros(
+                (batch_size, 1, 1, key_len), dtype=query.dtype, device=query.device
+            ).masked_fill(mask, -1e18)
         else:
-            # a + c
+            # a + c : fold u-bias into the query (u was added after scaling, so it stays
+            # outside the 1/sqrt(d) factor -> pass scale=1.0 to SDPA below).
             u = self.u.reshape(1, head_count, 1, dim_per_head)
-            a_c = torch.matmul(query + u, key.transpose(2, 3))
+            q_eff = query + u
 
-            # rel_emb = self.relative_pe(rel_emb)           # (b, t_q, t_k) -> (b, t_q, t_k, h)
-            rel_emb = rel_emb.reshape(                      # (b, t_q, t_k, h) -> (b, t_q, t_k, head, h/head)
+            rel_emb = rel_emb.reshape(                      # (b, t_q, t_k, head, h/head)
                 batch_size, query_len, key_len, head_count, dim_per_head)
 
-            # b + d
-            query = query.unsqueeze(-2)                     # (b, head, t_q, h/head) -> (b, head, t_q, 1, h/head)
-            rel_emb_t = rel_emb.permute(0, 3, 1, 4, 2)      # (b, t_q, t_k, head, h/head) -> (b, head, t_q, h/head, t_k)
-
+            # b + d : per-(i,j) dot product of (scaled query + v) with the relative emb.
             v = self.v.reshape(1, head_count, 1, 1, dim_per_head)
-            b_d = torch.matmul(query + v, rel_emb_t
-                               ).squeeze(-2)                # (b, head, t_q, 1, t_k) -> (b, head, t_q, t_k)
+            rel_emb_t = rel_emb.permute(0, 3, 1, 4, 2)      # (b, head, t_q, h/head, t_k)
+            b_d = torch.matmul(query.unsqueeze(-2) + v, rel_emb_t).squeeze(-2)  # (b, head, t_q, t_k)
 
-            scores = a_c + b_d
+            attn_bias = b_d.masked_fill(mask, -1e18)        # additive bias incl. padding mask
 
-        scores = scores.float()
-
-        mask = mask.unsqueeze(1)                            # (B, 1, 1, T_values)
-        #scores = scores.masked_fill(mask, -1e18)
-        scores = scores.masked_fill(mask, -torch.inf)
-
-        # 3) Apply attention dropout and compute context vectors.
-        attn = self.softmax(scores)
-        drop_attn = self.dropout(attn)
-
-        context_original = torch.matmul(drop_attn, value)   # -> (b, head, t_q, h/head)
-        context = unshape(context_original)                 # -> (b, t_q, h)
+        # 3) Fused softmax-weighted context. dropout_p is 0 at eval; at train time it
+        #    matches the original nn.Dropout(attention_dropout) on the attention weights.
+        context = F.scaled_dot_product_attention(
+            q_eff, key, value,
+            attn_mask=attn_bias,
+            dropout_p=self.dropout.p if self.training else 0.0,
+            scale=1.0,
+        )                                                   # (b, head, t_q, h/head)
+        context = unshape(context)                          # (b, t_q, h)
 
         output = self.final_linear(context)
-        attns = attn.view(batch_size, head_count, query_len, key_len)
 
-        return output, attns
+        # Attention weights are not consumed downstream; skip materializing them.
+        return output, None
 
 
 class SALayerXL(nn.Module):
@@ -239,7 +246,25 @@ class AttnEncoderXL(nn.Module):
         self.atom_embedding = nn.Embedding(len(ELEM_LIST) , self.d_model, padding_idx=0)
         self.rbf = RBFExpansion(args)
 
-        self.time_dim = self.d_model - self.rbf.dim
+        if args.oxd_states:
+            self.rbf_oxd = RBFExpansion(args, oxd=True)
+            if args.pred_del_BE:
+                self.rbf_del_BE = RBFExpansion(args, del_BE=True)
+                self.time_dim = self.d_model - self.rbf.dim - self.rbf_oxd.dim - self.rbf_del_BE.dim
+                print(f"Model dim: {self.d_model}, RBF dim: {self.rbf.dim}, DEL BE dim: {self.rbf_del_BE.dim}")
+                print(f"Using oxd_states and BE, time_dim: {self.time_dim}")
+            else:
+                self.time_dim = self.d_model - self.rbf.dim - self.rbf_oxd.dim
+                print(f"Model dim: {self.d_model}, RBF dim: {self.rbf.dim}")
+                print(f"Using oxd_states, time_dim: {self.time_dim}")
+        elif args.pred_del_BE:
+            self.rbf_del_BE = RBFExpansion(args, del_BE=True)
+            self.time_dim = self.d_model - self.rbf.dim - self.rbf_del_BE.dim
+            print(f"Model dim: {self.d_model}, RBF dim: {self.rbf.dim}, DEL BE dim: {self.rbf_del_BE.dim}")
+            print(f"Using del BE, time_dim: {self.time_dim}")
+        else:
+            self.time_dim = self.d_model - self.rbf.dim
+
         self.time_embed = nn.Sequential(
             nn.Linear(self.time_dim, self.time_dim),
             nn.SiLU(),
@@ -295,34 +320,156 @@ class AttnEncoderXL(nn.Module):
         for _ in range(self.post_processing_layers):
             rbf_layers.append(Block(self.rbf.dim))
         self.rbf_linear = torch.nn.Sequential(*rbf_layers)
-        # self.rbf_final_linear = torch.nn.Linear(self.rbf.dim, 1)
+
+        if self.args.oxd_states:
+            rbf_oxd_layers = []
+            for _ in range(self.post_processing_layers):
+                rbf_oxd_layers.append(Block(self.rbf_oxd.dim))
+            self.rbf_oxd_linear = torch.nn.Sequential(*rbf_oxd_layers)
+
+        if self.args.pred_del_BE:
+            rbf_del_BE_layers = []
+            for _ in range(self.post_processing_layers):
+                rbf_del_BE_layers.append(Block(self.rbf_del_BE.dim))
+            self.rbf_del_BE_linear = torch.nn.Sequential(*rbf_del_BE_layers)
 
     def id2emb(self, src_token_id):
         return self.atom_embedding(src_token_id)
         
-    def forward(self, src_token_ids, lengths, bond_matrix, timestep):
+    def get_embeds(self, src, lengths, bond_matrix, timestep, oxd_states=None, del_BE=None):
+        if timestep.dim() == 0:
+            timestep = timestep.repeat(lengths.shape[0])
+        # print(f"timestep after repeat (if needed): {timestep.shape}")
+
+        b, n, _ = bond_matrix.shape
+        timestep = self.time_embed(timestep_embedding(timestep, self.time_dim))
+        # print("After time_embed:", timestep.shape)
+        timestep = timestep.unsqueeze(1).unsqueeze(1) # unsqueeze to match bond n x n
+        timestep = timestep.expand(-1, n, n, -1) # unsqueeze to match bond n x n
+        # print("timestep after unsqueeze/repeat:", timestep.shape)
+
+        mask = ~sequence_mask(lengths).unsqueeze(1)
+        matrix_masks = ~(~mask * ~mask.transpose(1, 2)).bool()
+        rbf_bond_matrix = self.rbf(bond_matrix, matrix_masks)
+        rbf_bond_matrix = self.rbf_linear(rbf_bond_matrix)           # b, n, n, 1 -> b, n, n, rbf-dim
+        
+        if oxd_states is None and del_BE is None:
+            rel_emb = torch.cat((rbf_bond_matrix, timestep), dim=-1) # b, n, n, d
+        elif oxd_states is not None and del_BE is None:
+            if(oxd_states.dim() == 2):
+                oxd_states = oxd_states.unsqueeze(-1) # b, n, 1
+            atom_mask = ~sequence_mask(lengths).unsqueeze(-1)
+            rbf_oxd_states = self.rbf_oxd(oxd_states, atom_mask)
+            rbf_oxd_states = self.rbf_oxd_linear(rbf_oxd_states) # b, n, 1, 1 -> b, n, 1, rbf-dim
+            rbf_oxd_states = rbf_oxd_states.expand(-1, -1, rbf_bond_matrix.size(2), -1) # b, n, 1, rbf-dim -> b, n, n, rbf-dim
+            rel_emb = torch.cat((rbf_bond_matrix, rbf_oxd_states, timestep), dim=-1) # b, n, n, d
+        elif del_BE is not None and oxd_states is None:
+            rbf_del_BE = self.rbf_del_BE(del_BE, matrix_masks)
+            rbf_del_BE = self.rbf_del_BE_linear(rbf_del_BE)
+            rel_emb = torch.cat((rbf_bond_matrix, rbf_del_BE, timestep), dim=-1)
+        else:
+            rbf_del_BE = self.rbf_del_BE(del_BE, matrix_masks)
+            rbf_del_BE = self.rbf_del_BE_linear(rbf_del_BE)
+
+            if(oxd_states.dim() == 2):
+                oxd_states = oxd_states.unsqueeze(-1) # b, n, 1
+            atom_mask = ~sequence_mask(lengths).unsqueeze(-1)
+            rbf_oxd_states = self.rbf_oxd(oxd_states, atom_mask)
+            rbf_oxd_states = self.rbf_oxd_linear(rbf_oxd_states) # b, n, 1, 1 -> b, n, 1, rbf-dim
+            rbf_oxd_states = rbf_oxd_states.expand(-1, -1, rbf_bond_matrix.size(2), -1) # b, n, 1, rbf-dim -> b, n, n, rbf-dim
+
+            rel_emb = torch.cat((rbf_bond_matrix, rbf_del_BE, rbf_oxd_states, timestep), dim=-1)
+
+
+        # src = self.atom_embedding(src_token_id)
+        # h_place = (src_token_id == 1).float().unsqueeze(-1).repeat(1, 1, src.shape[-1])
+
+        b, n, d = src.shape 
+ 
+        # a_i - raw atom embeddings
+        a_i = src * math.sqrt(self.d_model)
+        a_i = self.dropout(a_i)
+        
+        mask = ~sequence_mask(lengths).unsqueeze(1)
+        atom_mask = mask.squeeze(1).unsqueeze(-1)
+        
+        raw_embeds = [self.layer_norm(a_i).masked_fill(atom_mask,0)]
+
+        if self.args.shared_attention_layer == 1:
+            layer = self.attention_layer
+            for i in range(self.num_layers):
+                a_i = layer(a_i, mask, rel_emb)
+        else:
+            for layer in self.attention_layers:
+                a_i = layer(a_i, mask, rel_emb)
+                raw_embeds.append(self.layer_norm(a_i).masked_fill(atom_mask,0))
+                
+        return raw_embeds
+    
+    def forward(self, src_token_ids, lengths, bond_matrix, timestep, oxd_states=None, del_BE=None):
         """adapt from onmt TransformerEncoder
             src_token_id: (b, t, h)
             lengths: (b,)
 
             NEW on Jan'23: return: (b, t, h)
         """
+        # print("=== AttnEncoderXL.forward ===")
+        # print(f"oxd_states is None: {oxd_states is None}")
+        # print(f"src.shape: {src.shape}")
+        # print(f"lengths.shape: {lengths.shape}")
+        # print(f"bond_matrix.shape: {bond_matrix.shape}")
+        # print(f"timestep.shape: {timestep.shape}")
+        # if oxd_states is not None:
+        #     print(f"oxd_states.shape: {oxd_states.shape}")
+        # print(f"self.time_dim: {self.time_dim}")
+        # print(f"self.d_model: {self.d_model}")
+        # print(f"self.rbf.dim: {self.rbf.dim}")
+        
         src = self.id2emb(src_token_ids)
+
         if timestep.dim() == 0:
             timestep = timestep.repeat(lengths.shape[0])
+        # print(f"timestep after repeat (if needed): {timestep.shape}")
 
         b, n, _ = bond_matrix.shape
         timestep = self.time_embed(timestep_embedding(timestep, self.time_dim))
+        # print("After time_embed:", timestep.shape)
         timestep = timestep.unsqueeze(1).unsqueeze(1) # unsqueeze to match bond n x n
-        timestep = timestep.repeat(1, n, n, 1) # unsqueeze to match bond n x n
+        timestep = timestep.expand(-1, n, n, -1) # unsqueeze to match bond n x n
+        # print("timestep after unsqueeze/repeat:", timestep.shape)
 
         mask = ~sequence_mask(lengths).unsqueeze(1)
-        
         matrix_masks = ~(~mask * ~mask.transpose(1, 2)).bool()
         rbf_bond_matrix = self.rbf(bond_matrix, matrix_masks)
         rbf_bond_matrix = self.rbf_linear(rbf_bond_matrix)           # b, n, n, 1 -> b, n, n, rbf-dim
         
-        rel_emb = torch.cat((rbf_bond_matrix, timestep), dim=-1) # b, n, n, d
+        if oxd_states is None and del_BE is None:
+            rel_emb = torch.cat((rbf_bond_matrix, timestep), dim=-1) # b, n, n, d
+        elif oxd_states is not None and del_BE is None:
+            if(oxd_states.dim() == 2):
+                oxd_states = oxd_states.unsqueeze(-1) # b, n, 1
+            atom_mask = ~sequence_mask(lengths).unsqueeze(-1)
+            rbf_oxd_states = self.rbf_oxd(oxd_states, atom_mask)
+            rbf_oxd_states = self.rbf_oxd_linear(rbf_oxd_states) # b, n, 1, 1 -> b, n, 1, rbf-dim
+            rbf_oxd_states = rbf_oxd_states.expand(-1, -1, rbf_bond_matrix.size(2), -1) # b, n, 1, rbf-dim -> b, n, n, rbf-dim
+            rel_emb = torch.cat((rbf_bond_matrix, rbf_oxd_states, timestep), dim=-1) # b, n, n, d
+        elif del_BE is not None and oxd_states is None:
+            rbf_del_BE = self.rbf_del_BE(del_BE, matrix_masks)
+            rbf_del_BE = self.rbf_del_BE_linear(rbf_del_BE)
+            rel_emb = torch.cat((rbf_bond_matrix, rbf_del_BE, timestep), dim=-1)
+        else:
+            rbf_del_BE = self.rbf_del_BE(del_BE, matrix_masks)
+            rbf_del_BE = self.rbf_del_BE_linear(rbf_del_BE)
+
+            if(oxd_states.dim() == 2):
+                oxd_states = oxd_states.unsqueeze(-1) # b, n, 1
+            atom_mask = ~sequence_mask(lengths).unsqueeze(-1)
+            rbf_oxd_states = self.rbf_oxd(oxd_states, atom_mask)
+            rbf_oxd_states = self.rbf_oxd_linear(rbf_oxd_states) # b, n, 1, 1 -> b, n, 1, rbf-dim
+            rbf_oxd_states = rbf_oxd_states.expand(-1, -1, rbf_bond_matrix.size(2), -1) # b, n, 1, rbf-dim -> b, n, n, rbf-dim
+
+            rel_emb = torch.cat((rbf_bond_matrix, rbf_del_BE, rbf_oxd_states, timestep), dim=-1)
+
 
         # src = self.atom_embedding(src_token_id)
         # h_place = (src_token_id == 1).float().unsqueeze(-1).repeat(1, 1, src.shape[-1])
@@ -348,14 +495,24 @@ class AttnEncoderXL(nn.Module):
         query_diag = self.query_diag_w(a_i)             # b,n,d @ d,d -> b,n,d
         key_diag = self.key_diag_w(a_i)                 # b,n,d @ d,d -> b,n,d
         value_diag = self.value_diag_w(a_i)             # b,n,d @ d,d -> b,n,d
-
-        diag_scores = torch.matmul(query_diag, key_diag.transpose(1, 2)) # b,n,d @ b,d,n -> b,n,n
-        #diag_scores = diag_scores.masked_fill(matrix_masks, 1e-9)
-        diag_scores = diag_scores.masked_fill(matrix_masks, -1e18)
-        diag_scores = self.softmax(diag_scores / math.sqrt(self.d_model))
-        context = torch.matmul(diag_scores, value_diag)    # b,n,n @ b,n,d -> b,n,d
-        diag = self.final_diag_w(context).view(b, n)       # b,n,d @ d,1 -> b,n,1 -> b,n
         
+        # diag_scores = torch.matmul(query_diag, key_diag.transpose(1, 2)) # b,n,d @ b,d,n -> b,n,n
+        # #diag_scores = diag_scores.masked_fill(matrix_masks, 1e-9)
+        # diag_scores = diag_scores.masked_fill(matrix_masks, -1e18)
+        # #diag_scores = self.softmax(diag_scores) / math.sqrt(self.d_model)
+        # diag_scores = self.softmax(diag_scores / math.sqrt(self.d_model))
+        # context = torch.matmul(diag_scores, value_diag)    # b,n,n @ b,n,d -> b,n,d
+        
+        diag_bias = torch.zeros_like(
+            matrix_masks, dtype=query_diag.dtype
+        ).masked_fill(matrix_masks, -1e18).unsqueeze(1)    # (b, 1, n, n)
+        context = F.scaled_dot_product_attention(
+            query_diag.unsqueeze(1), key_diag.unsqueeze(1), value_diag.unsqueeze(1),
+            attn_mask=diag_bias,
+            scale=1.0 / math.sqrt(self.d_model),
+        ).squeeze(1)                                       # b,n,d
+        diag = self.final_diag_w(context).view(b, n)       # b,n,d @ d,1 -> b,n,1 -> b,n
+
         # non diagonal prediction
         query = self.query_w(a_i)                          # b,n,d @ d,d -> b,n,d
         key = self.key_w(a_i) 
@@ -366,8 +523,8 @@ class AttnEncoderXL(nn.Module):
         rbfw_ij = self.rel_emb_w(rel_emb).view(b, n, n)   # b,n,n,d @ d,1 -> b,n,n,1 -> b,n,n
         out = a_ij + rbfw_ij
 
-        out = torch.diagonal_scatter(out, diag, dim1=-2, dim2=-1)
-
+        out.diagonal(dim1=1, dim2=2).copy_(diag)
+        
         out = zero_center_output(out, matrix_masks)
         out = (out + out.transpose(1, 2))
 

@@ -19,6 +19,8 @@ from utils.train_utils import get_lr, grad_norm, log_rank_0, NoamLR, \
     param_count, param_norm, set_seed, setup_logger, log_args
 from torch.nn.init import xavier_uniform_
 import torch.optim as optim
+from utils.data_utils import MATRIX_PAD
+
 
 torch.set_printoptions(precision=4, profile="full", sci_mode=False, linewidth=10000)
 np.set_printoptions(threshold=sys.maxsize, precision=4, suppress=True, linewidth=500)
@@ -35,6 +37,8 @@ def init_dist(args):
         logging.info(f"Device rank: {dist.get_rank()}")
         sys.stdout.flush()
 
+def collate_first_item(batch):
+    return batch[0]
 
 def init_model(args):
     state = {}
@@ -72,19 +76,20 @@ def init_model(args):
     return graph_attn_model, flow_model, state
 
 def init_loader(args, dataset, batch_size: int, bucket_size: int = 1000,
-                shuffle: bool = False, epoch: int = None, use_sort: bool =True):
+                shuffle: bool = False, epoch: int = None, use_sort: bool =True,
+                drop_last: bool = True):
+    
     seed: int = 0 if epoch is None else epoch
     if use_sort: dataset.sort()
     if shuffle: 
         dataset.shuffle_in_bucket(bucket_size=bucket_size, seed=seed)
-    
     dataset.batch(
         batch_type=args.batch_type,
         batch_size=batch_size
     )
 
     if args.local_rank != -1:
-        sampler = DistributedSampler(dataset, shuffle=shuffle)
+        sampler = DistributedSampler(dataset, shuffle=shuffle, drop_last=drop_last)
         if epoch is not None:
             sampler.set_epoch(epoch)
     else:
@@ -95,7 +100,7 @@ def init_loader(args, dataset, batch_size: int, bucket_size: int = 1000,
         batch_size=1,
         sampler=sampler,
         num_workers=args.num_workers,
-        collate_fn=lambda _batch: _batch[0],
+        collate_fn=collate_first_item,
         pin_memory=True
     )
 
@@ -138,6 +143,7 @@ def _optimize(args, model, optimizer, scheduler):
 def main(args):
     args.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     device = args.device
+    print(device)
 
     init_dist(args)
     log_args(args, 'training')
@@ -166,11 +172,11 @@ def main(args):
     accuracy = []
     for epoch in range(args.epoch):
         log_rank_0(f"Epoch: {epoch}")
-
         train_loader = init_loader(args, train_dataset,
                                 batch_size=args.train_batch_size,
                                 shuffle=True,
                                 epoch=epoch)
+        log_rank_0(f"Steps per epoch: {len(train_loader)}")
         model.train()
         model.zero_grad(set_to_none=True)
         for train_batch in train_loader:
@@ -179,7 +185,6 @@ def main(args):
                 exit(0)
 
             train_batch.to(device)
-            
 
             y = train_batch.src_token_ids
             y_len = train_batch.src_lens
@@ -187,21 +192,51 @@ def main(args):
             x1 = train_batch.tgt_matrices
             matrix_masks = train_batch.matrix_masks
             
+            if args.pred_del_BE:
+                x0_sample = flow.sample_noised_zero_like(x0)
+                t = torch.rand(x0.shape[0]).type_as(x0)
+                xt = flow.sample_conditional_pt_from_zero(x1 - x0, t)  # equivalent to t * (x1 - x0)
+                
+                ut = flow.compute_conditional_vector_field(x0_sample, x1 - x0) # noised zero -> x1 - x0 = del BE
 
-            x0_sample = flow.sample_be_matrix(x0)
 
-            t = torch.rand(x0.shape[0]).type_as(x0)
+                if args.oxd_states:
+                    src_oxd_states = train_batch.src_oxd_states
+                    tgt_oxd_states = train_batch.tgt_oxd_states
+                    t_scalar = t
+                    t = t.reshape(-1, *([1] * (src_oxd_states.dim() - 1)))
+                    oxd_states_t = t * tgt_oxd_states + (1 - t) * src_oxd_states
+                    vt = model(y, y_len, x0, t_scalar, oxd_states=oxd_states_t, del_BE=xt)
+                else:
+                    vt = model(y, y_len, x0, t, del_BE=xt)
 
-            xt = flow.sample_conditional_pt(x0, x1, t)
-            ut = flow.compute_conditional_vector_field(x0_sample, x1)
+                loss = (vt - ut) * matrix_masks
+                loss = torch.sum((loss) ** 2) / loss.shape[0]
+                (loss / args.accumulation_count).backward()
+                losses.append(loss.item())
 
-            vt = model(y, y_len, xt, t)
-            loss = (vt - ut) * matrix_masks
-            #loss = torch.sum((loss) ** 2) / matrix_masks.sum()  # per-valid-entry
-            loss = torch.sum((loss) ** 2) / loss.shape[0]       # per-sample
-            
-            (loss / args.accumulation_count).backward()
-            losses.append(loss.item())
+            else:
+                x0_sample = flow.sample_be_matrix(x0)
+
+                t = torch.rand(x0.shape[0]).type_as(x0)
+                
+                xt = flow.sample_conditional_pt(x0, x1, t)
+                ut = flow.compute_conditional_vector_field(x0_sample, x1)
+
+                if args.oxd_states:
+                    src_oxd_states = train_batch.src_oxd_states
+                    tgt_oxd_states = train_batch.tgt_oxd_states
+                    t_scalar = t
+                    t = t.reshape(-1, *([1] * (src_oxd_states.dim() - 1)))
+                    oxd_states_t = t * tgt_oxd_states + (1 - t) * src_oxd_states
+                    vt = model(y, y_len, xt, t_scalar, oxd_states=oxd_states_t)
+                else:
+                    vt = model(y, y_len, xt, t)
+
+                loss = (vt - ut) * matrix_masks
+                loss = torch.sum((loss) ** 2) / loss.shape[0]
+                (loss / args.accumulation_count).backward()
+                losses.append(loss.item())
 
             accum += 1
             if accum == args.accumulation_count:
@@ -219,17 +254,35 @@ def main(args):
 
             if (accum == 0) and (total_step > 0) and (total_step % args.eval_iter == 0):
                 val_count = 50
+                dist.barrier()
+                
                 val_loader = init_loader(args, val_dataset,
                                         batch_size=args.val_batch_size,
                                         shuffle=True,
-                                        epoch=epoch)
+                                        epoch=epoch,
+                                        drop_last=False)
                 from eval_multiGPU import get_predictions
-                metrics = get_predictions(args, model, flow, val_loader, val_count)
+                dist.barrier()
+                validation_top1 = getattr(args, "validation_top1", False)
+                metrics = get_predictions(
+                    args,
+                    model,
+                    flow,
+                    val_loader,
+                    val_count,
+                    top1_only=validation_top1,
+                )
+                
+                dist.barrier()
+                
                 if dist.get_rank() == 0:
                     metrics = np.array(metrics)
                     log_rank_0(metrics.shape)
                     topk_accuracies = np.mean(metrics[:, 0].astype(bool)) # correct smiles
-                    log_rank_0(f"Topk accuracies: {(topk_accuracies * 100): .2f}")
+                    log_rank_0(f"Top-k accuracy: {(topk_accuracies * 100): .2f}")
+                    if validation_top1:
+                        top1_accuracy = np.mean(metrics[:, -1].astype(bool))
+                        log_rank_0(f"Top-1 accuracy: {(top1_accuracy * 100): .2f}")
                 model.train()
 
             # Important: saving only at one node or the ckpt would be corrupted!

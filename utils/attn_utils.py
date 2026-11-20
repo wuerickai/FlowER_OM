@@ -45,4 +45,3 @@ def sequence_mask(lengths, max_len=None):
             .type_as(lengths)
             .repeat(batch_size, 1)
             .lt(lengths.unsqueeze(1)))
-

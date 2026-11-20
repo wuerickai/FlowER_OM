@@ -35,18 +35,35 @@ class ConditionalFlowMatcher(nn.Module):
     def zero_centered_noise(self, size, node_mask_batch):
         rand = torch.randn(size).to(self.device)
         x_batch = rand * node_mask_batch
-        map_zero_center = torch.vmap(zero_center_func) # map on multiple batch
-        return map_zero_center(x_batch, node_mask_batch).masked_fill(~(node_mask_batch.bool()), 1e-19)
+        mean = x_batch.sum(dim=(-2, -1), keepdim=True) / node_mask_batch.sum(dim=(-2, -1), keepdim=True)
+        x_batch = x_batch - mean * node_mask_batch
+        return x_batch.masked_fill(~(node_mask_batch.bool()), 1e-19)
 
-    def sample_be_matrix(self, matrix):
+    def sample_be_matrix(self, matrix, sigma=None):
+        sigma = self.sigma if sigma is None else sigma
         node_mask = (matrix[:, :, 0] != MATRIX_PAD)
         masks = (node_mask.unsqueeze(1) * node_mask.unsqueeze(2)).long()
 
         noise = self.zero_centered_noise(masks.shape, masks) # (n, n, b, d)
         noise = 0.5 * (noise + noise.transpose(1, 2))
-        matrix = matrix + noise * self.sigma
-        
+        matrix = matrix + noise * sigma
+
+        #print(matrix)
+
         return matrix
+    
+    def sample_noised_zero_like(self, matrix, sigma=None):
+        sigma = self.sigma if sigma is None else sigma
+        matrix_clone = matrix.clone()
+        node_mask = (matrix_clone[:, :, 0] != MATRIX_PAD)
+        masks = (node_mask.unsqueeze(1) * node_mask.unsqueeze(2)).long()
+        matrix_clone = matrix_clone * (1 - masks)
+
+        noise = self.zero_centered_noise(masks.shape, masks) # (n, n, b, d)
+        noise = 0.5 * (noise + noise.transpose(1, 2))
+        matrix_clone += noise * sigma
+        
+        return matrix_clone
 
     def sample_conditional_pt(self, x0, x1, t):
         """
@@ -70,6 +87,30 @@ class ConditionalFlowMatcher(nn.Module):
         """
         t = t.reshape(-1, *([1] * (x0.dim() - 1)))
         mu_t = t * x1 + (1 - t) * x0
+        return self.sample_be_matrix(mu_t)
+    
+    def sample_conditional_pt_from_zero(self, x , t):
+        """
+        Draw a sample from the probability path N(t * x1 + (1 - t) * x0, sigma), see (Eq.14) [1].
+
+        Parameters
+        ----------
+        x0 : Tensor, shape (bs, *dim)
+            represents the source minibatch
+        x1 : Tensor, shape (bs, *dim)
+            represents the target minibatch
+        t : FloatTensor, shape (bs)
+
+        Returns
+        -------
+        xt : Tensor, shape (bs, *dim)
+
+        References
+        ----------
+        [1] Improving and Generalizing Flow-Based Generative Models with minibatch optimal transport, Preprint, Tong et al.
+        """
+        t = t.reshape(-1, *([1] * (x.dim() - 1)))
+        mu_t = t * x
         return self.sample_be_matrix(mu_t)
 
     def compute_conditional_vector_field(self, x0, x1):
